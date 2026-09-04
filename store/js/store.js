@@ -232,6 +232,13 @@ const Store = (() => {
     }
 
     let fulfillment = 'pickup';
+    let payNow = false; // false = pay in person (pickup/delivery), true = pay online now
+
+    function placeOrderLabel() {
+      if (payNow) return 'Pay online now';
+      return 'Place order (pay ' + (fulfillment === 'pickup' ? 'at pickup' : 'on delivery') + ')';
+    }
+
     document.querySelector('.screen').innerHTML = `
       <div class="section-label">Your order</div>
       <div class="panel">${cart.map(c => `
@@ -245,13 +252,19 @@ const Store = (() => {
         <button class="btn btn-secondary" id="fulfillDelivery">Delivery</button>
       </div>
 
+      <div class="section-label">How would you like to pay?</div>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-primary" id="payInPerson">Pay in person</button>
+        <button class="btn btn-secondary" id="payOnline">Pay online now</button>
+      </div>
+
       <div class="section-label">Your details</div>
       <div class="field"><label>Your name</label><input id="custName" placeholder="Full name"></div>
       <div class="field"><label>Phone number</label><input id="custPhone" type="tel" placeholder="10-digit mobile number"></div>
       <div id="fulfillmentFields">${renderFulfillmentFields(fulfillment)}</div>
       <div class="field"><label>Notes (optional)</label><textarea id="notes" rows="2" placeholder="Anything we should know?"></textarea></div>
-      <div class="field hint" id="payHint">Pay in person when you collect your order — no online payment yet.</div>
-      <button class="btn btn-primary" id="placeOrderBtn">Place order (pay ${fulfillment === 'pickup' ? 'at pickup' : 'on delivery'})</button>
+      <div class="field hint" id="payHint">Pay in person when you collect your order.</div>
+      <button class="btn btn-primary" id="placeOrderBtn">${placeOrderLabel()}</button>
     `;
 
     function setFulfillment(next) {
@@ -260,13 +273,25 @@ const Store = (() => {
       document.getElementById('fulfillDelivery').className = 'btn ' + (next === 'delivery' ? 'btn-primary' : 'btn-secondary');
       document.getElementById('fulfillmentFields').innerHTML = renderFulfillmentFields(next);
       document.getElementById('totalsPanel').innerHTML = renderTotals(next);
-      document.getElementById('payHint').textContent = next === 'pickup'
-        ? 'Pay in person when you collect your order — no online payment yet.'
-        : 'Pay in cash/UPI to the delivery person — no online payment yet.';
-      document.getElementById('placeOrderBtn').textContent = 'Place order (pay ' + (next === 'pickup' ? 'at pickup' : 'on delivery') + ')';
+      updatePayHint();
+      document.getElementById('placeOrderBtn').textContent = placeOrderLabel();
+    }
+    function setPayNow(next) {
+      payNow = next;
+      document.getElementById('payInPerson').className = 'btn ' + (!next ? 'btn-primary' : 'btn-secondary');
+      document.getElementById('payOnline').className = 'btn ' + (next ? 'btn-primary' : 'btn-secondary');
+      updatePayHint();
+      document.getElementById('placeOrderBtn').textContent = placeOrderLabel();
+    }
+    function updatePayHint() {
+      document.getElementById('payHint').textContent = payNow
+        ? 'You will be taken to a secure Razorpay payment window after placing this order.'
+        : (fulfillment === 'pickup' ? 'Pay in person when you collect your order.' : 'Pay in cash/UPI to the delivery person.');
     }
     document.getElementById('fulfillPickup').onclick = () => setFulfillment('pickup');
     document.getElementById('fulfillDelivery').onclick = () => setFulfillment('delivery');
+    document.getElementById('payInPerson').onclick = () => setPayNow(false);
+    document.getElementById('payOnline').onclick = () => setPayNow(true);
 
     document.getElementById('placeOrderBtn').onclick = async (e) => {
       const name = document.getElementById('custName').value.trim();
@@ -286,7 +311,8 @@ const Store = (() => {
         p_delivery_pincode: null,
         p_delivery_landmark: null,
         p_notes: notes,
-        p_items: cart.map(c => ({ item_id: c.itemId, quantity: c.quantity }))
+        p_items: cart.map(c => ({ item_id: c.itemId, quantity: c.quantity })),
+        p_pay_online: payNow
       };
       if (fulfillment === 'pickup') {
         const pickupLoc = document.getElementById('pickupLoc').value;
@@ -312,12 +338,66 @@ const Store = (() => {
         if (error) throw error;
         const order = Array.isArray(data) ? data[0] : data;
         clearCart();
-        navigate('#/order/' + order.order_number + '/' + encodeURIComponent(phone));
+        if (payNow) {
+          e.target.textContent = 'Opening payment…';
+          await startRazorpayPayment(order.order_number, phone, name);
+        } else {
+          navigate('#/order/' + order.order_number + '/' + encodeURIComponent(phone));
+        }
       } catch (err) {
         toast(err.message || 'Could not place order. Please try again.');
-        e.target.disabled = false; e.target.textContent = 'Place order (pay ' + (fulfillment === 'pickup' ? 'at pickup' : 'on delivery') + ')';
+        e.target.disabled = false; e.target.textContent = placeOrderLabel();
       }
     };
+  }
+
+  // ---------- RAZORPAY ----------
+  // Payment confirmation is never trusted from this callback alone —
+  // verify-payment re-checks the signature server-side before marking
+  // anything paid, and the razorpay-webhook Edge Function is the
+  // durable fallback if the browser closes before this callback runs.
+
+  async function startRazorpayPayment(orderNumber, phone, name) {
+    try {
+      const { data, error } = await Sb.client.functions.invoke('create-razorpay-order', { body: { order_number: orderNumber } });
+      if (error) throw error;
+      if (data.error) throw new Error(data.error);
+
+      const rzp = new Razorpay({
+        key: data.key_id,
+        amount: data.amount,
+        currency: data.currency,
+        order_id: data.razorpay_order_id,
+        name: 'Sri Products',
+        description: 'Order ' + orderNumber,
+        prefill: { name: name, contact: phone },
+        theme: { color: '#101d33' },
+        handler: async (response) => {
+          try {
+            const { data: verifyData, error: verifyError } = await Sb.client.functions.invoke('verify-payment', {
+              body: {
+                order_number: orderNumber,
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature
+              }
+            });
+            if (verifyError || verifyData.error) toast('Payment received — confirming with the shop, check "Track an order" shortly.');
+          } catch (e) { /* webhook will still confirm this independently */ }
+          navigate('#/order/' + orderNumber + '/' + encodeURIComponent(phone));
+        },
+        modal: {
+          ondismiss: () => {
+            toast('Payment not completed. Your order is saved — you can pay from "Track an order".');
+            navigate('#/order/' + orderNumber + '/' + encodeURIComponent(phone));
+          }
+        }
+      });
+      rzp.open();
+    } catch (err) {
+      toast(err.message || 'Could not start online payment. Your order is saved as pending.');
+      navigate('#/order/' + orderNumber + '/' + encodeURIComponent(phone));
+    }
   }
 
   // ---------- ORDER CONFIRMATION / STATUS ----------
@@ -352,9 +432,15 @@ const Store = (() => {
           <div class="totals-row grand"><span>Total</span><span>${money(order.grand_total)}</span></div>
         </div>
         ${addressBlock}
-        <div class="field hint" style="margin-top:14px;">${isDelivery ? 'Have cash/UPI ready for the delivery person.' : 'Pay at pickup. Bring this order number.'}</div>
+        <div class="field hint" style="margin-top:14px;">${
+          order.payment_method === 'online' && order.payment_status !== 'paid' ? 'Online payment not completed yet.'
+          : isDelivery ? 'Have cash/UPI ready for the delivery person.' : 'Pay at pickup. Bring this order number.'
+        }</div>
+        ${order.payment_method === 'online' && order.payment_status === 'unpaid' && order.status === 'pending' ? '<button class="btn btn-primary" id="payNowBtn" style="margin-top:10px;">Pay now</button>' : ''}
         ${order.status === 'pending' ? '<button class="btn btn-danger" id="cancelBtn" style="margin-top:10px;">Cancel this order</button>' : ''}
       `;
+      const payNowBtn = document.getElementById('payNowBtn');
+      if (payNowBtn) payNowBtn.onclick = () => startRazorpayPayment(orderNumber, phone, '');
       const cancelBtn = document.getElementById('cancelBtn');
       if (cancelBtn) cancelBtn.onclick = async () => {
         if (!window.confirm('Cancel this order?')) return;
