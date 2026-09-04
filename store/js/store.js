@@ -3,8 +3,9 @@
    Vanilla JS, hash router, no build step — same pattern as the internal
    Business Manager app, kept separate on purpose (public traffic vs.
    staff-only traffic shouldn't share a codebase or a set of keys).
-   Phase 1 scope: browse catalog, cart, guest checkout, pickup only,
-   pay-on-pickup only. No login, no delivery, no online payment yet.
+   Phase 1 + 2 scope: browse catalog, cart, guest checkout, pickup or
+   delivery with flat/free-threshold shipping, pay in person either
+   way. No login, no online payment gateway yet.
    ========================================================================== */
 
 const Store = (() => {
@@ -191,51 +192,130 @@ const Store = (() => {
     if (!cart.length) { navigate('#/shop'); return; }
     shell('Checkout', `<div class="empty-state">Loading…</div>`);
     let locations = [];
+    let settings = { delivery_fee: 49, free_delivery_threshold: 999 };
     if (Sb.ready) {
-      const { data, error } = await Sb.client.from('v_pickup_locations').select('*');
-      if (!error) locations = data;
+      const [locRes, settingsRes] = await Promise.all([
+        Sb.client.from('v_pickup_locations').select('*'),
+        Sb.client.from('v_store_settings').select('*')
+      ]);
+      if (!locRes.error) locations = locRes.data;
+      if (!settingsRes.error) settingsRes.data.forEach(s => { settings[s.key] = Number(s.value); });
     }
+    const subtotal = cartSubtotal(cart);
+
+    function shippingFeeFor(fulfillment) {
+      if (fulfillment !== 'delivery') return 0;
+      return subtotal >= settings.free_delivery_threshold ? 0 : settings.delivery_fee;
+    }
+    function renderTotals(fulfillment) {
+      const fee = shippingFeeFor(fulfillment);
+      return `
+        <div class="totals-row"><span>Subtotal</span><span>${money(subtotal)}</span></div>
+        ${fulfillment === 'delivery' ? `<div class="totals-row"><span>Delivery</span><span>${fee === 0 ? 'Free' : money(fee)}</span></div>` : ''}
+        <div class="totals-row grand"><span>Total</span><span>${money(subtotal + fee)}</span></div>
+      `;
+    }
+    function renderFulfillmentFields(fulfillment) {
+      if (fulfillment === 'pickup') {
+        return `<div class="field"><label>Pickup location</label>
+          <select id="pickupLoc">${locations.map(l => `<option value="${esc(l.id)}">${esc(l.name)} — ${esc(l.address)}</option>`).join('') || '<option value="">No pickup locations configured</option>'}</select>
+        </div>`;
+      }
+      return `
+        <div class="field"><label>Address line 1</label><input id="addr1" placeholder="House/flat no., street"></div>
+        <div class="field"><label>Address line 2 (optional)</label><input id="addr2" placeholder="Area, apartment name"></div>
+        <div class="field"><label>City</label><input id="addrCity" placeholder="City"></div>
+        <div class="field"><label>Pincode</label><input id="addrPincode" inputmode="numeric" placeholder="6-digit pincode"></div>
+        <div class="field"><label>Landmark (optional)</label><input id="addrLandmark" placeholder="Nearby landmark"></div>
+        <div class="field hint">${subtotal >= settings.free_delivery_threshold ? 'Free delivery on this order.' : `Free delivery on orders over ${money(settings.free_delivery_threshold)}.`}</div>
+      `;
+    }
+
+    let fulfillment = 'pickup';
     document.querySelector('.screen').innerHTML = `
       <div class="section-label">Your order</div>
       <div class="panel">${cart.map(c => `
         <div class="list-row"><div class="row-title">${esc(c.name)}</div><div class="amount">${c.quantity} ${esc(c.unit)} × ${money(c.price)}</div></div>
       `).join('')}</div>
-      <div class="totals-panel"><div class="totals-row grand"><span>Subtotal</span><span>${money(cartSubtotal(cart))}</span></div></div>
+      <div class="totals-panel" id="totalsPanel">${renderTotals(fulfillment)}</div>
 
-      <div class="section-label">Pickup details</div>
+      <div class="section-label">How would you like to get it?</div>
+      <div class="btn-row" style="margin-top:0;">
+        <button class="btn btn-primary" id="fulfillPickup">Pickup</button>
+        <button class="btn btn-secondary" id="fulfillDelivery">Delivery</button>
+      </div>
+
+      <div class="section-label">Your details</div>
       <div class="field"><label>Your name</label><input id="custName" placeholder="Full name"></div>
       <div class="field"><label>Phone number</label><input id="custPhone" type="tel" placeholder="10-digit mobile number"></div>
-      <div class="field"><label>Pickup location</label>
-        <select id="pickupLoc">${locations.map(l => `<option value="${esc(l.id)}">${esc(l.name)} — ${esc(l.address)}</option>`).join('') || '<option value="">No pickup locations configured</option>'}</select>
-      </div>
+      <div id="fulfillmentFields">${renderFulfillmentFields(fulfillment)}</div>
       <div class="field"><label>Notes (optional)</label><textarea id="notes" rows="2" placeholder="Anything we should know?"></textarea></div>
-      <div class="field hint">Pay in person when you collect your order — no online payment yet.</div>
-      <button class="btn btn-primary" id="placeOrderBtn">Place order (pay at pickup)</button>
+      <div class="field hint" id="payHint">Pay in person when you collect your order — no online payment yet.</div>
+      <button class="btn btn-primary" id="placeOrderBtn">Place order (pay ${fulfillment === 'pickup' ? 'at pickup' : 'on delivery'})</button>
     `;
+
+    function setFulfillment(next) {
+      fulfillment = next;
+      document.getElementById('fulfillPickup').className = 'btn ' + (next === 'pickup' ? 'btn-primary' : 'btn-secondary');
+      document.getElementById('fulfillDelivery').className = 'btn ' + (next === 'delivery' ? 'btn-primary' : 'btn-secondary');
+      document.getElementById('fulfillmentFields').innerHTML = renderFulfillmentFields(next);
+      document.getElementById('totalsPanel').innerHTML = renderTotals(next);
+      document.getElementById('payHint').textContent = next === 'pickup'
+        ? 'Pay in person when you collect your order — no online payment yet.'
+        : 'Pay in cash/UPI to the delivery person — no online payment yet.';
+      document.getElementById('placeOrderBtn').textContent = 'Place order (pay ' + (next === 'pickup' ? 'at pickup' : 'on delivery') + ')';
+    }
+    document.getElementById('fulfillPickup').onclick = () => setFulfillment('pickup');
+    document.getElementById('fulfillDelivery').onclick = () => setFulfillment('delivery');
+
     document.getElementById('placeOrderBtn').onclick = async (e) => {
       const name = document.getElementById('custName').value.trim();
       const phone = document.getElementById('custPhone').value.trim();
-      const pickupLoc = document.getElementById('pickupLoc').value;
       const notes = document.getElementById('notes').value.trim();
       if (!name) { toast('Enter your name.'); return; }
       if (!/^\d{10}$/.test(phone.replace(/\D/g, ''))) { toast('Enter a valid 10-digit phone number.'); return; }
-      if (!pickupLoc) { toast('Select a pickup location.'); return; }
+
+      const payload = {
+        p_fulfillment_type: fulfillment,
+        p_customer_name: name,
+        p_customer_phone: phone,
+        p_pickup_location_id: null,
+        p_delivery_address_line1: null,
+        p_delivery_address_line2: null,
+        p_delivery_city: null,
+        p_delivery_pincode: null,
+        p_delivery_landmark: null,
+        p_notes: notes,
+        p_items: cart.map(c => ({ item_id: c.itemId, quantity: c.quantity }))
+      };
+      if (fulfillment === 'pickup') {
+        const pickupLoc = document.getElementById('pickupLoc').value;
+        if (!pickupLoc) { toast('Select a pickup location.'); return; }
+        payload.p_pickup_location_id = pickupLoc;
+      } else {
+        const addr1 = document.getElementById('addr1').value.trim();
+        const city = document.getElementById('addrCity').value.trim();
+        const pincode = document.getElementById('addrPincode').value.trim();
+        if (!addr1) { toast('Enter your address.'); return; }
+        if (!city) { toast('Enter your city.'); return; }
+        if (!/^\d{6}$/.test(pincode)) { toast('Enter a valid 6-digit pincode.'); return; }
+        payload.p_delivery_address_line1 = addr1;
+        payload.p_delivery_address_line2 = document.getElementById('addr2').value.trim();
+        payload.p_delivery_city = city;
+        payload.p_delivery_pincode = pincode;
+        payload.p_delivery_landmark = document.getElementById('addrLandmark').value.trim();
+      }
+
       e.target.disabled = true; e.target.textContent = 'Placing order…';
       try {
-        const { data, error } = await Sb.client.rpc('create_order', {
-          p_customer_name: name,
-          p_customer_phone: phone,
-          p_pickup_location_id: pickupLoc,
-          p_notes: notes,
-          p_items: cart.map(c => ({ item_id: c.itemId, quantity: c.quantity }))
-        });
+        const { data, error } = await Sb.client.rpc('create_order', payload);
         if (error) throw error;
         const order = Array.isArray(data) ? data[0] : data;
         clearCart();
         navigate('#/order/' + order.order_number + '/' + encodeURIComponent(phone));
       } catch (err) {
         toast(err.message || 'Could not place order. Please try again.');
-        e.target.disabled = false; e.target.textContent = 'Place order (pay at pickup)';
+        e.target.disabled = false; e.target.textContent = 'Place order (pay ' + (fulfillment === 'pickup' ? 'at pickup' : 'on delivery') + ')';
       }
     };
   }
@@ -250,15 +330,29 @@ const Store = (() => {
       const order = Array.isArray(data) ? data[0] : data;
       if (!order) { document.querySelector('.screen').innerHTML = errorState('Order not found. Check your order number and phone number.'); return; }
       const items = order.items || [];
+      const isDelivery = order.fulfillment_type === 'delivery';
+      const addressBlock = isDelivery ? `
+        <div class="section-label">Delivery address</div>
+        <div class="panel"><div class="list-row"><div>
+          <div class="row-title">${esc(order.delivery_address_line1)}${order.delivery_address_line2 ? ', ' + esc(order.delivery_address_line2) : ''}</div>
+          <div class="row-sub">${esc(order.delivery_city)} — ${esc(order.delivery_pincode)}${order.delivery_landmark ? ' · Near ' + esc(order.delivery_landmark) : ''}</div>
+        </div></div></div>
+      ` : '';
       document.querySelector('.screen').innerHTML = `
         <div class="empty-state" style="padding:8px 0 20px;">
           <div class="empty-title">Order ${esc(order.order_number)}</div>
           ${statusBadge(order.status)}
+          <div class="muted" style="margin-top:6px;">${isDelivery ? 'Delivery' : 'Pickup'} · Pay ${isDelivery ? 'on delivery' : 'at pickup'}</div>
         </div>
         <div class="section-label">Items</div>
         <div class="panel">${items.map(i => `<div class="list-row"><div class="row-title">${esc(i.name)}</div><div class="amount">${i.quantity} ${esc(i.unit)} — ${money(i.lineTotal)}</div></div>`).join('')}</div>
-        <div class="totals-panel"><div class="totals-row grand"><span>Total</span><span>${money(order.subtotal)}</span></div></div>
-        <div class="field hint" style="margin-top:14px;">Pay at pickup. Bring this order number.</div>
+        <div class="totals-panel">
+          <div class="totals-row"><span>Subtotal</span><span>${money(order.subtotal)}</span></div>
+          ${isDelivery ? `<div class="totals-row"><span>Delivery</span><span>${Number(order.shipping_fee) === 0 ? 'Free' : money(order.shipping_fee)}</span></div>` : ''}
+          <div class="totals-row grand"><span>Total</span><span>${money(order.grand_total)}</span></div>
+        </div>
+        ${addressBlock}
+        <div class="field hint" style="margin-top:14px;">${isDelivery ? 'Have cash/UPI ready for the delivery person.' : 'Pay at pickup. Bring this order number.'}</div>
         ${order.status === 'pending' ? '<button class="btn btn-danger" id="cancelBtn" style="margin-top:10px;">Cancel this order</button>' : ''}
       `;
       const cancelBtn = document.getElementById('cancelBtn');
